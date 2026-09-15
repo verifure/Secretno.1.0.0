@@ -315,7 +315,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         body = (
             f"🤫 <b>Шёпот для @{html.escape(target)}</b>\n"
-            f"<i>Сообщение видно только получателю.</i>"
+            f"<i>Сообщение видно только получателю. Подпишись на @VerifureAPI</i>"
         )
         results.append(
             InlineQueryResultArticle(
