@@ -5,12 +5,24 @@ Whisper Bot — эфемерные сообщения в Telegram.
 репозитория никогда не могла сломать деплой (`python main.py` работает всегда,
 из любой директории).
 
-Идея: @botname Привет @username — во всплывающем результате inline-режима
-появляется кнопка "Отправить шёпот". После отправки в чат приходит карточка с
-кнопкой "Прочитать 🔓". Текст видит только тот, кто нажал кнопку — Telegram
-показывает его во всплывающем окне (answerCallbackQuery(show_alert=True)),
-которое видно только нажавшему. Бота не нужно добавлять в чат — inline-режим
-работает из любого чата, группы или канала.
+Два способа отправить шёпот:
+
+  1. Inline-режим — @botname Привет @username из любого чата, бота не нужно
+     добавлять никуда. Работает как раньше: получатель нажимает "Прочитать 🔓",
+     текст показывается во всплывающем окне (answerCallbackQuery(show_alert)).
+     У чистого inline-режима нет доступа к chat_id того чата, куда ушло
+     сообщение — это ограничение платформы, а не библиотеки, поэтому для него
+     всплывающее окно остаётся единственным путём доставки.
+
+  2. Команда /whisper внутри группы, где бот состоит участником — тогда chat_id
+     известен, и при нажатии "Прочитать 🔓" бот сначала пробует настоящее
+     эфемерное сообщение (Bot API 10.2/10.3: sendMessage с
+     ephemeral_message_parameters, отправленное через Bot.do_api_request в
+     обход версии библиотеки — ровно так же, как это сделано в проекте
+     verifure-game). Успех проверяется по наличию ephemeral_message_id в
+     ответе сервера; если поле не пришло — функция ещё не активна на стороне
+     Telegram для этого чата, и бот тихо откатывается на проверенный
+     answerCallbackQuery(show_alert), не теряя доставку.
 """
 
 from __future__ import annotations
@@ -83,6 +95,8 @@ WHISPER_TTL = _int("WHISPER_TTL", 7 * 24 * 3600)          # время жизн�
 BURN_AFTER_READING = _bool("BURN_AFTER_READING", False)    # удалять после прочтения
 NOTIFY_SENDER = _bool("NOTIFY_SENDER", True)                # писать автору о прочтении
 MAX_TEXT_LEN = _int("MAX_TEXT_LEN", 200)                    # лимит всплывающего окна Telegram
+EPHEMERAL_ENABLED = _bool("EPHEMERAL_ENABLED", True)         # пробовать настоящие эфемерные
+REPLACE_CALLBACK_MESSAGE = _bool("REPLACE_CALLBACK_MESSAGE", True)  # заменять карточку эфемерным
 
 _public_url = (
     os.getenv("PUBLIC_URL")
@@ -108,6 +122,9 @@ class Whisper:
     target: str  # username получателя, нижний регистр, без @
     text: str
     created_at: float
+    chat_id: Optional[int] = None  # известен только для /whisper внутри группы;
+    # для inline-режима остаётся None — у платформы нет способа сообщить боту
+    # chat_id чата, куда ушло inline-сообщение.
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -200,16 +217,19 @@ CB_PREFIX = "w:"
 
 HELP_TEXT = (
     "🤫 <b>Шёпот — эфемерные сообщения</b>\n\n"
-    "Меня <b>не нужно добавлять в чат</b>. Просто напишите в поле ввода "
-    "любого чата:\n\n"
-    "<code>@{username} Привет @verifure</code>\n\n"
-    "Сверху появится кнопка «Отправить шёпот». Нажмите — в чат уйдёт сообщение "
-    "с кнопкой «Прочитать 🔓», и текст увидит <b>только</b> указанный "
-    "получатель. Остальные получат отказ.\n\n"
-    "<b>Правила:</b>\n"
-    "• получатель — <b>последний</b> @username в запросе;\n"
-    "• текст — всё остальное;\n"
-    "• длина текста — до {limit} символов (лимит всплывающего окна Telegram);\n"
+    "<b>Способ 1 — из любого чата, без добавления бота:</b>\n"
+    "<code>@{username} Привет @verifure</code>\n"
+    "Сверху появится кнопка «Отправить шёпот». Получатель читает текст во "
+    "всплывающем окне.\n\n"
+    "<b>Способ 2 — внутри группы, где я состою участником:</b>\n"
+    "<code>/whisper Привет @verifure</code>\n"
+    "Здесь я умею доставить настоящее приватное сообщение (если Telegram уже "
+    "включил эту функцию для чата) — не просто всплывающее окно, а отдельное "
+    "сообщение, видимое только получателю.\n\n"
+    "<b>Правила для обоих способов:</b>\n"
+    "• получатель — <b>последний</b> @username, либо тот, на чьё сообщение вы "
+    "отвечаете;\n"
+    "• текст — всё остальное, до {limit} символов;\n"
     "• у получателя должен быть публичный @username;\n"
     "• автор всегда может перечитать свой шёпот."
 )
@@ -232,6 +252,57 @@ def make_key(user_id: int, target: str, text: str) -> str:
     """Короткий детерминированный ключ: одинаковый запрос не плодит записи."""
     raw = f"{user_id}|{target}|{text}".encode("utf-8")
     return hashlib.blake2s(raw, digest_size=8).hexdigest()  # 16 символов
+
+
+def whisper_body(whisper: Whisper) -> str:
+    sender = html.escape(whisper.sender_name)
+    if whisper.sender_username:
+        sender = f'<a href="https://t.me/{whisper.sender_username}">{sender}</a>'
+    return f"🤫 <b>Шёпот от {sender}</b>\n\n{html.escape(whisper.text)}"
+
+
+async def try_send_ephemeral(
+    bot,
+    chat_id: int,
+    receiver_user_id: int,
+    text: str,
+    callback_query_id: str,
+) -> bool:
+    """Пытается доставить настоящее эфемерное сообщение (Bot API 10.2/10.3).
+
+    Сделано ровно так же, как в verifure-game: сырой вызов do_api_request в
+    обход того, поддерживает ли установленная версия python-telegram-bot этот
+    параметр нативно. Условие валидности запроса по правилам Bot API —
+    передан callback_query_id (ответ на нажатие кнопки, в течение ~15 секунд),
+    это условие у нас выполнено всегда, так как вызов идёт из on_read.
+
+    Возвращает True, только если сервер реально подтвердил эфемерность,
+    вернув ephemeral_message_id. Если поля нет — сервер тихо прислал обычный
+    ответ (функция ещё не активна для этого чата/бота), и вызывающий код
+    обязан откатиться на answerCallbackQuery(show_alert=True)."""
+    kw = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": ParseMode.HTML,
+        "ephemeral_message_parameters": {
+            "receiver_user_id": receiver_user_id,
+            "callback_query_id": callback_query_id,
+            "replace_callback_query_message": REPLACE_CALLBACK_MESSAGE,
+        },
+    }
+    try:
+        result = await bot.do_api_request("sendMessage", api_kwargs=kw)
+    except Exception as exc:  # noqa: BLE001 — любая ошибка здесь лишь повод на откат
+        log.debug("try_send_ephemeral: запрос не прошёл: %s", exc)
+        return False
+
+    if isinstance(result, dict) and result.get("ephemeral_message_id"):
+        return True
+    log.debug(
+        "try_send_ephemeral: сервер принял запрос, но не вернул ephemeral_message_id "
+        "— похоже, функция ещё не активна для этого чата"
+    )
+    return False
 
 
 def article(result_id: str, title: str, description: str, message: str) -> InlineQueryResultArticle:
@@ -315,7 +386,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         body = (
             f"🤫 <b>Шёпот для @{html.escape(target)}</b>\n"
-            f"<i>Сообщение видно только получателю. Подпишись на @VerifureAPI</i>"
+            f"<i>Сообщение видно только получателю.</i>"
         )
         results.append(
             InlineQueryResultArticle(
@@ -355,7 +426,21 @@ async def on_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await cq.answer(f"Ваш шёпот для @{whisper.target}:\n\n{whisper.text}", show_alert=True)
         return
 
-    await cq.answer(whisper.text, show_alert=True)
+    delivered_ephemeral = False
+    if EPHEMERAL_ENABLED and whisper.chat_id is not None:
+        delivered_ephemeral = await try_send_ephemeral(
+            context.bot, whisper.chat_id, user.id, whisper_body(whisper), cq.id
+        )
+
+    if delivered_ephemeral:
+        # Ответ уже ушёл отдельным эфемерным сообщением — просто закрываем
+        # индикатор загрузки на кнопке, без алерта поверх него.
+        await cq.answer()
+    else:
+        # Либо эфемерные ещё не активны на сервере, либо это inline-сообщение
+        # без известного chat_id (платформенное ограничение) — используем
+        # проверенный способ, который уже работает.
+        await cq.answer(whisper.text, show_alert=True)
 
     if NOTIFY_SENDER and whisper.sender_id != user.id:
         try:
@@ -378,6 +463,86 @@ async def on_read(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
             except TelegramError as exc:
                 log.debug("Не удалось отредактировать inline-сообщение: %s", exc)
+
+
+async def on_whisper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/whisper @username текст — использовать внутри группы, где бот состоит
+    участником. Именно этот путь даёт боту chat_id и делает возможной
+    настоящую эфемерную доставку; команды всегда доходят до бота, даже при
+    включённом режиме приватности группы, поэтому специальных настроек в
+    BotFather для этого не требуется — бот просто должен быть добавлен."""
+    message = update.effective_message
+    if message.chat.type == "private":
+        await message.reply_text(
+            "Команда /whisper работает внутри группы, где я состою участником — "
+            "добавьте меня в чат и повторите там."
+        )
+        return
+
+    raw = message.text or ""
+    # Срезаем "/whisper" или "/whisper@botname" из начала строки.
+    rest = re.sub(r"^/\w+(@\w+)?\s*", "", raw, count=1)
+
+    target = None
+    text = None
+    if message.reply_to_message and message.reply_to_message.from_user:
+        replied = message.reply_to_message.from_user
+        target = (replied.username or "").lower() or None
+        text = _clean_ws(rest)
+        if target is None:
+            await message.reply_text(
+                "🤐 У этого пользователя нет публичного @username — "
+                "шёпот ему отправить нельзя."
+            )
+            return
+    else:
+        target, text = parse_query(rest)
+
+    if not target:
+        await message.reply_text(
+            "Укажите получателя: <code>/whisper @username текст</code> "
+            "или ответьте командой на его сообщение.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not text:
+        await message.reply_text("Добавьте текст шёпота после получателя.")
+        return
+    if len(text) > MAX_TEXT_LEN:
+        await message.reply_text(
+            f"Слишком длинно: {len(text)} из {MAX_TEXT_LEN} символов — сократите текст."
+        )
+        return
+
+    user = message.from_user
+    key = make_key(user.id, target, text)
+    await store.put(
+        key,
+        Whisper(
+            sender_id=user.id,
+            sender_name=user.full_name,
+            sender_username=(user.username or None),
+            target=target,
+            text=text,
+            created_at=time.time(),
+            chat_id=message.chat.id,
+        ),
+        ttl=WHISPER_TTL,
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Прочитать 🔓", callback_data=f"{CB_PREFIX}{key}")]]
+    )
+    await message.reply_text(
+        f"🤫 <b>Шёпот для @{html.escape(target)}</b>\n"
+        f"<i>Сообщение увидит только получатель.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+def _clean_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
 
 
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,10 +574,16 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("start", "Как пользоваться ботом"),
             BotCommand("help", "Как пользоваться ботом"),
+            BotCommand("whisper", "Отправить шёпот внутри группы (настоящая эфемерность)"),
         ]
     )
     me = await app.bot.get_me()
-    log.info("Бот @%s запущен. Inline-режим должен быть включён в @BotFather.", me.username)
+    log.info(
+        "Бот @%s запущен. Inline-режим должен быть включён в @BotFather. "
+        "Эфемерная доставка: %s.",
+        me.username,
+        "включена (проверяется по факту при каждом /whisper)" if EPHEMERAL_ENABLED else "отключена",
+    )
 
 
 async def _post_shutdown(app: Application) -> None:
@@ -429,6 +600,7 @@ def build_application() -> Application:
         .build()
     )
     app.add_handler(CommandHandler(["start", "help"], on_start))
+    app.add_handler(CommandHandler("whisper", on_whisper_command))
     app.add_handler(InlineQueryHandler(on_inline_query))
     app.add_handler(CallbackQueryHandler(on_read, pattern=rf"^{CB_PREFIX}"))
     app.add_error_handler(on_error)
