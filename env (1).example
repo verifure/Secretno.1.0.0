@@ -1,0 +1,22 @@
+# Обязательно: токен от @BotFather
+BOT_TOKEN=123456789:AA...
+
+# Необязательно ------------------------------------------------------------
+# Redis (плагин Railway). Без него тексты хранятся в памяти и теряются при рестарте.
+# REDIS_URL=redis://default:pass@host:6379
+
+WHISPER_TTL=604800
+BURN_AFTER_READING=false
+NOTIFY_SENDER=true
+
+# Пробовать настоящие эфемерные сообщения (Bot API 10.2/10.3) для шёпотов,
+# отправленных командой /whisper внутри группы, где бот состоит участником.
+# Если сервер Telegram ещё не поддерживает это для конкретного чата, бот
+# автоматически откатывается на проверенное всплывающее окно.
+EPHEMERAL_ENABLED=true
+# Заменять карточку с кнопкой эфемерным сообщением у того, кто его читает
+REPLACE_CALLBACK_MESSAGE=true
+
+USE_WEBHOOK=false
+# PUBLIC_URL=https://my-bot.up.railway.app
+# WEBHOOK_SECRET=some-random-string
